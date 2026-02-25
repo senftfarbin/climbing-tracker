@@ -1,0 +1,9 @@
+timestamp,climb1_grade,climb1_completed,climb2_grade,climb2_completed,climb3_grade,climb3_completed,climb4_grade,climb4_completed,completed_count
+2026-02-24T20:13:47.007268,V5,True,V4,True,V4,True,V4,True,4
+2026-02-24T20:14:40.732877,V5,True,V4,True,V4,True,V4,True,4
+2026-02-24T20:16:15.214116,V5,True,V4,True,V4,True,V4,True,4
+2026-02-24T20:17:40.621631,V4,True,V5,True,V5,True,V5,True,4
+2026-02-24T20:18:55.177081,V5,True,V4,True,V4,True,V4,True,4
+2026-02-24T20:30:38.280036,V3,False,V2,False,V3,False,V3,False,0
+2026-02-24T20:32:50.621081,V3,True,V4,True,V4,True,V5,True,4
+2026-02-24T20:45:41.150206,V3,True,V4,True,V4,True,V5,True,4
