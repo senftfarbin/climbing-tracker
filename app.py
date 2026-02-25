@@ -5,44 +5,63 @@ import csv
 import os
 from datetime import datetime
 import gspread
-from google.oauth2.service_account import Credentials
+import json
 
 SHEET_URL = "https://docs.google.com/spreadsheets/d/1D8VM5Na1LBIIoMV86Ie8rg6C4jmRceDozupNVydr73w/edit?usp=sharing"
 
 
 def _get_gs_client() -> gspread.Client:
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = Credentials.from_service_account_info(
-        st.secrets["gcp_service_account"], scopes=scopes
-    )
-    return gspread.authorize(creds)
-
-
-def save_to_sheets(data: dict) -> None:
     """
-    Append a single row with keys: date, activity, results.
+    Create an authenticated gspread client using Streamlit secrets.
+    Supports either:
+    - st.secrets["gcp_sa_json"]: full service account JSON as a string
+    - [gcp_service_account] table: keys copied from the JSON
     """
-    try:
-        client = _get_gs_client()
-        sh = client.open_by_url(SHEET_URL)
-        ws = sh.sheet1
+    cfg = None
 
-        # If sheet is empty, write header first
-        existing = ws.get_all_values()
-        if not existing:
-            ws.append_row(["Date", "Activity", "Results"])
+    # Preferred: keep the original JSON exactly as Google gave it
+    if "gcp_sa_json" in st.secrets:
+        cfg = json.loads(st.secrets["gcp_sa_json"])
+    elif "gcp_service_account" in st.secrets:
+        cfg = dict(st.secrets["gcp_service_account"])
+    else:
+        raise RuntimeError(
+            "No Google service account config found. "
+            "Set either 'gcp_sa_json' or '[gcp_service_account]' in secrets.toml."
+        )
 
-        ws.append_row([data["date"], data["activity"], data["results"]])
-    except Exception as e:  # noqa: BLE001
-        st.error(f"Failed to save to Google Sheets: {e}")
+    return gspread.service_account_from_dict(cfg)
 
-st.title("Max Hang Tracker")
-st.caption("One focused session at a time.")
 
-page = st.sidebar.radio("Page", ["Max Hang Timer", "4x4 Tracker"])
+def save_to_sheets(data) -> None:
+    """
+    Appends data to Google Sheets. 
+    Handles both the 4x4 List and the Hangboard Dictionary.
+    """
+    client = _get_gs_client()
+    sh = client.open_by_url(SHEET_URL)
+    ws = sh.sheet1
+
+    # Check if we are being sent a List (4x4) or a Dictionary (Hangboard)
+    if isinstance(data, list):
+        row_to_send = data
+    elif isinstance(data, dict):
+        # Convert the old Hangboard dictionary into the new 11-column format
+        # [Date, Activity, C1_G, C1_R, C2_G, C2_R, C3_G, C3_R, C4_G, C4_R, Total]
+        row_to_send = [
+            data.get("date"), 
+            data.get("activity"), 
+            "-", "-", "-", "-", "-", "-", "-", "-", # Placeholders
+            data.get("results")
+        ]
+    else:
+        return # Safety break
+
+    ws.append_row(row_to_send)
+
+st.title("Climbing Tracker")
+
+page = st.sidebar.radio("Workout", ["Max Hang Timer", "4x4 Tracker"])
 
 # Try to keep the screen awake while this page is open (supported browsers only)
 components.html(
@@ -78,107 +97,79 @@ requestWakeLock();
 )
 
 if page == "Max Hang Timer":
-    # --- HANGBOARD TIMER ---
-    st.header("Max Hang Timer (7s on / 2min off)")
-    st.write("Press **Ready** before each hang. The timer runs **5s prep**, **7s hang**, then **2min rest**.")
+    st.header("Max Hang Timer")
+    
+    reps = st.slider("Total Hangs Planned", 1, 10, 5)
+    weight = st.number_input("Added weight (lbs)", value=0.0, step=0.5)
 
-    reps = st.slider("Number of Hangs", 1, 10, 5)
-    weight = st.number_input(
-        "Max hang added weight (kg, use negative for assistance)",
-        value=0.0,
-        step=0.5,
-    )
-
-    # Track how many hangs you've already completed
     if "current_rep" not in st.session_state:
         st.session_state.current_rep = 0
+    if "is_resting" not in st.session_state:
+        st.session_state.is_resting = False
+    if "rest_start_time" not in st.session_state:
+        st.session_state.rest_start_time = 0
 
-    st.write(f"Hangs completed: **{st.session_state.current_rep} / {reps}**")
+    st.subheader(f"Progress: {st.session_state.current_rep} / {reps}")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        ready = st.button("I'm ready – start next hang")
-    with col2:
-        reset = st.button("Reset session")
+    # --- THE START BUTTON & ACTION ---
+    if not st.session_state.is_resting and st.session_state.current_rep < reps:
+        if st.button("🚀 START NEXT HANG", use_container_width=True):
+            current = st.session_state.current_rep + 1
+            placeholder = st.empty()
+            bar = st.progress(0) # Create the progress bar
+            
+            # 1. PREP (5s)
+            for t in range(5, -1, -1):
+                percent = int(((5 - t) / 5) * 100)
+                bar.progress(percent)
+                placeholder.metric(f"PREP (Hang {current})", f"{t}s" if t > 0 else "GO!")
+                time.sleep(1)
+            
+            # 2. HANG (7s)
+            bar.progress(0) # Reset bar for the hang
+            for t in range(7, -1, -1):
+                percent = int(((7 - t) / 7) * 100)
+                bar.progress(percent)
+                placeholder.metric(f"🔥 HANG! 🔥", f"{t}s" if t > 0 else "DONE!")
+                time.sleep(1)
+            
+            # 3. LOGGING
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            rep_data = [timestamp, "Hangboard Rep", f"Rep {current}", f"{weight}kg", "-", "-", "-", "-", "-", "-", f"Hang {current}/{reps}"]
+            save_to_sheets(rep_data)
+            
+            # 4. UPDATE STATE
+            st.session_state.current_rep += 1
+            st.session_state.is_resting = True
+            st.session_state.rest_start_time = time.time()
+            st.rerun()
 
-    if reset:
-        st.session_state.current_rep = 0
-
-    # If all hangs are done, show completion message
-    if st.session_state.current_rep >= reps:
-        st.success("All hangs complete! Adjust reps or reset to start a new session.")
-    elif ready:
-        hang_time = 7
-        prep_time = 5
-        rest_time = 120
-        current = st.session_state.current_rep + 1
-
+    # --- THE REST TIMER ---
+    if st.session_state.is_resting:
         placeholder = st.empty()
-        progress_bar = st.progress(0)
+        bar = st.progress(0) # Rest progress bar
+        
+        elapsed = time.time() - st.session_state.rest_start_time
+        total_rest = 120
+        remaining = int(total_rest - elapsed)
 
-        # Prep phase
-        st.info(f"Hang {current}: Get ready!")
-        for elapsed in range(prep_time):
-            remaining = prep_time - elapsed
-            placeholder.metric("Prep – hang starts in (seconds)", remaining)
-            progress_bar.progress(int((elapsed + 1) / prep_time * 100))
+        if remaining > 0:
+            percent = min(100, int((elapsed / total_rest) * 100))
+            bar.progress(percent)
+            mins, secs = divmod(remaining, 60)
+            placeholder.metric("⏳ RESTING", f"{mins:02d}:{secs:02d}")
             time.sleep(1)
+            st.rerun()
+        else:
+            bar.progress(100)
+            st.session_state.is_resting = False
+            st.toast("Rest Over! Ready for next hang.", icon="🔔")
+            st.rerun()
 
-        # Hang phase
-        st.warning(f"Hang {current}: HANG!")
-        progress_bar.progress(0)
-        for elapsed in range(hang_time):
-            remaining = hang_time - elapsed
-            placeholder.metric("Hang – seconds remaining", remaining)
-            progress_bar.progress(int((elapsed + 1) / hang_time * 100))
-            time.sleep(1)
-
-        # Log this completed rep immediately (even if you stop the workout later)
-        rep_log_file = "hang_reps.csv"
-        rep_file_exists = os.path.exists(rep_log_file)
-        with open(rep_log_file, "a", newline="") as f:
-            rep_writer = csv.writer(f)
-            if not rep_file_exists:
-                rep_writer.writerow(["timestamp", "rep_number", "reps_planned", "weight_kg"])
-            rep_writer.writerow([datetime.now().isoformat(), current, reps, weight])
-
-        # Rest phase (always give 2 minutes off the board)
-        st.info("REST – 2 minutes off the board")
-        progress_bar.progress(0)
-        for elapsed in range(rest_time):
-            remaining = rest_time - elapsed
-            placeholder.metric("Rest – seconds remaining", remaining)
-            progress_bar.progress(int((elapsed + 1) / rest_time * 100))
-            time.sleep(1)
-
-        st.session_state.current_rep += 1
-
-        if st.session_state.current_rep >= reps:
-            # Log completed session with timestamp and max hang weight
-            log_file = "hang_sessions.csv"
-            file_exists = os.path.exists(log_file)
-            with open(log_file, "a", newline="") as f:
-                writer = csv.writer(f)
-                if not file_exists:
-                    writer.writerow(["timestamp", "reps", "weight_kg"])
-                writer.writerow([datetime.now().isoformat(), reps, weight])
-
-            st.balloons()
-            st.success("Session Complete! Nice work.")
-
-    # (Sessions and individual hangs are still logged to CSV files in the background.)
-
-    # Optional: log this hangboard session summary to Google Sheets
-    if st.button("Log Session to Google Sheet"):
-        results_str = f"{st.session_state.current_rep}/{reps} hangs at {weight} kg"
-        save_to_sheets(
-            {
-                "date": datetime.now().strftime("%Y-%m-%d"),
-                "activity": "Hangboard",
-                "results": results_str,
-            }
-        )
-        st.success("Hangboard session logged to Google Sheet.")
+    if st.button("🔄 Reset Session"):
+        st.session_state.current_rep = 0
+        st.session_state.is_resting = False
+        st.rerun()
 
 elif page == "4x4 Tracker":
     st.header("4x4 Tracker")
@@ -186,125 +177,65 @@ elif page == "4x4 Tracker":
 
     grades = [f"V{i}" for i in range(0, 11)]
 
-    # Session set counter
     if "fourbyfour_sets_logged" not in st.session_state:
         st.session_state.fourbyfour_sets_logged = 0
 
     st.write(f"Sets this session: **{st.session_state.fourbyfour_sets_logged} / 4**")
 
-    # Handle reset of completed checkboxes triggered after logging a set
-    if st.session_state.get("reset_4x4_done"):
-        for i in range(1, 5):
-            st.session_state.pop(f"4x4_done_{i}", None)
-        st.session_state.reset_4x4_done = False
-
     cols = st.columns(4)
-    selected_grades = []
-    completed_flags = []
+    # Lists to hold the data we will send to the sheet
+    climb_data = [] 
+    completed_count = 0
 
     for idx, col in enumerate(cols, start=1):
         with col:
             st.subheader(f"Climb {idx}")
-            grade = st.selectbox(
-                "Grade",
-                grades,
-                key=f"4x4_grade_{idx}",
-            )
+            grade = st.selectbox("Grade", grades, key=f"4x4_grade_{idx}")
             done = st.checkbox("Completed", key=f"4x4_done_{idx}")
-            selected_grades.append(grade)
-            completed_flags.append(done)
+            
+            # Store Grade and Result (Sent/Fail) for this specific climb
+            climb_data.append(grade)
+            climb_data.append("Sent" if done else "Fail")
+            if done:
+                completed_count += 1
 
-    completed_count = sum(1 for d in completed_flags if d)
     st.write(f"Completed this set: **{completed_count}/4 climbs**")
-
-    progress = st.progress(int(completed_count / 4 * 100))
+    st.progress(int(completed_count / 4 * 100))
 
     if "fourbyfour_rest_start" not in st.session_state:
         st.session_state.fourbyfour_rest_start = None
 
     if st.button("Log 4x4 Set"):
-        # Log this 4x4 set with timestamp and grades
-        set_log_file = "four_by_four_sets.csv"
-        file_exists = os.path.exists(set_log_file)
-        with open(set_log_file, "a", newline="") as f:
-            writer = csv.writer(f)
-            if not file_exists:
-                writer.writerow(
-                    [
-                        "timestamp",
-                        "climb1_grade",
-                        "climb1_completed",
-                        "climb2_grade",
-                        "climb2_completed",
-                        "climb3_grade",
-                        "climb3_completed",
-                        "climb4_grade",
-                        "climb4_completed",
-                        "completed_count",
-                    ]
-                )
-            writer.writerow(
-                [
-                    datetime.now().isoformat(),
-                    selected_grades[0],
-                    completed_flags[0],
-                    selected_grades[1],
-                    completed_flags[1],
-                    selected_grades[2],
-                    completed_flags[2],
-                    selected_grades[3],
-                    completed_flags[3],
-                    completed_count,
-                ]
-            )
+        # 1. Create the 11-column Row
+        # Format: [Timestamp, Activity, C1_G, C1_R, C2_G, C2_R, C3_G, C3_R, C4_G, C4_R, Total]
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        final_row = [timestamp, "4x4"] + climb_data + [f"{completed_count}/4"]
 
-        successful_grades = [
-            g for g, done in zip(selected_grades, completed_flags) if done
-        ]
-        results_str = f"{completed_count}/4 sends"
-        if successful_grades:
-            st.success(
-                f"Logged set with {completed_count} sends: {', '.join(successful_grades)}"
-            )
-        else:
-            st.success("Logged set with no completed climbs. Keep pushing next round!")
+        try:
+            save_to_sheets(final_row)
+            st.success("4x4 set logged to Google Sheet with detailed columns!")
+            st.session_state.fourbyfour_sets_logged += 1
+            
+            if st.session_state.fourbyfour_sets_logged >= 4:
+                st.balloons()
+            
+            # Start 3-minute rest timer
+            st.session_state.fourbyfour_rest_start = time.time()
+        except Exception as e:
+            st.error(f"Failed to save to Google Sheets: {e}")
 
-        # Increment session set counter
-        st.session_state.fourbyfour_sets_logged += 1
-        if st.session_state.fourbyfour_sets_logged >= 4:
-            st.balloons()
-            st.success("4 sets complete for this session! Nice effort.")
-
-        # Send summary row to Google Sheets
-        save_to_sheets(
-            {
-                "date": datetime.now().strftime("%Y-%m-%d"),
-                "activity": "4x4",
-                "results": results_str,
-            }
-        )
-
-        # Start 3-minute rest timer
-        st.session_state.fourbyfour_rest_start = time.time()
-
-        # Mark that we should reset checkboxes on the next run, then rerun
-        st.session_state.reset_4x4_done = True
-        st.rerun()
-
-    # Rest timer display using stored start time
+    # --- Rest Timer Display ---
     rest_placeholder = st.empty()
     if st.session_state.get("fourbyfour_rest_start"):
         elapsed = int(time.time() - st.session_state.fourbyfour_rest_start)
-        total_rest = 180
-        remaining = max(0, total_rest - elapsed)
+        remaining = max(0, 180 - elapsed)
 
         if remaining > 0:
             mins, secs = divmod(remaining, 60)
-            rest_placeholder.info(f"Rest: {mins:02d}:{secs:02d}")
-            # Trigger a soft countdown without blocking other interactions too much
+            rest_placeholder.warning(f"⏳ REST TIMER: {mins:02d}:{secs:02d}")
             time.sleep(1)
             st.rerun()
         else:
-            rest_placeholder.empty()
-            st.error("GET READY FOR NEXT SET!")
+            rest_placeholder.error("🔔 GET READY FOR NEXT SET!")
             st.session_state.fourbyfour_rest_start = None
+
